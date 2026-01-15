@@ -1,0 +1,29 @@
+Backend'te bir hata var - MongoDB'den gelen verilerle ilgili. ObjectId sorunu var. Düzeltelim:
+Action: file_editor view /app/backend/server.py
+Observation: /app/backend/server.py:
+555|        streak = 0
+556|        for goal in goals:
+557|            if goal.get("words_learned", 0) > 0 or goal.get("chat_minutes", 0) > 0:
+558|                streak += 1
+559|            else:
+560|                break
+561|        
+562|        # Total study time (approximate)
+563|        total_minutes = sum(g.get("chat_minutes", 0) for g in goals)
+564|        
+565|        return {
+566|            "total_words_learned": learned_words,
+567|            "total_words_reviewed": total_reviewed,
+568|            "streak_days": streak,
+569|            "total_study_minutes": total_minutes,
+570|            "current_level": "B2"  # Can be calculated based on learned_words
+571|        }
+572|    except Exception as e:
+573|        logger.error(f"Error getting progress: {e}")
+574|        raise HTTPException(status_code=500, detail=str(e))
+575|
+576|
+577|@api_router.get("/goals/today")
+578|async def get_today_goal():
+579|    """Get today's goal"""
+580|    try:

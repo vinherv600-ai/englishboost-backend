@@ -1,0 +1,632 @@
+Şimdi backend server.py dosyasını yeniden yazacağım - tüm kelime öğrenme, AI konuşma ve ilerleme takip sistemini ekleyeceğim:
+Action: file_editor create /app/backend/server.py --file-text "from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import logging
+from pathlib import Path
+from pydantic import BaseModel, Field, ConfigDict
+from typing import List, Optional, Dict
+import uuid
+from datetime import datetime, timezone, timedelta
+import io
+from emergentintegrations.llm.chat import LlmChat, UserMessage
+from emergentintegrations.llm.openai import OpenAITextToSpeech
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+# MongoDB connection
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+# Create the main app without a prefix
+app = FastAPI()
+
+# Create a router with the /api prefix
+api_router = APIRouter(prefix=\"/api\")
+
+# Initialize LLM and TTS
+EMERGENT_KEY = os.environ.get('EMERGENT_LLM_KEY')
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+# ============== MODELS ==============
+
+class Word(BaseModel):
+    model_config = ConfigDict(extra=\"ignore\")
+    
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    word: str
+    definition: str
+    example: str
+    level: str  # \"B1\", \"B2\", \"C1\"
+    word_type: str  # \"vocabulary\" or \"collocation\"
+    translation_tr: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class UserWord(BaseModel):
+    model_config = ConfigDict(extra=\"ignore\")
+    
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str = \"default_user\"  # For now, single user
+    word_id: str
+    learned: bool = False
+    review_count: int = 0
+    last_reviewed: Optional[datetime] = None
+    next_review: Optional[datetime] = None
+    confidence: int = 0  # 0-5, for spaced repetition
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ChatMessage(BaseModel):
+    model_config = ConfigDict(extra=\"ignore\")
+    
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str = \"default_user\"
+    role: str  # \"user\" or \"assistant\"
+    content: str
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class DailyGoal(BaseModel):
+    model_config = ConfigDict(extra=\"ignore\")
+    
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str = \"default_user\"
+    date: str  # YYYY-MM-DD
+    words_goal: int = 10
+    words_learned: int = 0
+    chat_minutes_goal: int = 15
+    chat_minutes: int = 0
+    completed: bool = False
+
+
+class Progress(BaseModel):
+    model_config = ConfigDict(extra=\"ignore\")
+    
+    user_id: str = \"default_user\"
+    total_words_learned: int = 0
+    current_level: str = \"B1\"
+    streak_days: int = 0
+    total_study_minutes: int = 0
+    last_study_date: Optional[str] = None
+
+
+# ============== REQUEST/RESPONSE MODELS ==============
+
+class WordCreate(BaseModel):
+    word: str
+    definition: str
+    example: str
+    level: str
+    word_type: str
+    translation_tr: Optional[str] = None
+
+
+class UserWordUpdate(BaseModel):
+    learned: bool
+    confidence: int
+
+
+class ChatRequest(BaseModel):
+    message: str
+    conversation_id: Optional[str] = \"default\"
+
+
+class TTSRequest(BaseModel):
+    text: str
+    voice: Optional[str] = \"nova\"
+
+
+class DailyGoalUpdate(BaseModel):
+    words_learned: Optional[int] = None
+    chat_minutes: Optional[int] = None
+
+
+# ============== HELPER FUNCTIONS ==============
+
+def calculate_next_review(confidence: int) -> datetime:
+    \"\"\"Calculate next review date based on spaced repetition\"\"\"
+    now = datetime.now(timezone.utc)
+    intervals = {
+        0: timedelta(hours=4),    # Very low confidence - review soon
+        1: timedelta(days=1),      # Low confidence - review tomorrow
+        2: timedelta(days=3),      # Medium confidence
+        3: timedelta(days=7),      # Good confidence
+        4: timedelta(days=14),     # High confidence
+        5: timedelta(days=30),     # Very high confidence
+    }
+    return now + intervals.get(confidence, timedelta(days=1))
+
+
+async def init_default_words():
+    \"\"\"Initialize database with B1-B2 words and collocations\"\"\"
+    count = await db.words.count_documents({})
+    if count == 0:
+        default_words = [
+            # B1-B2 Vocabulary
+            {
+                \"id\": str(uuid.uuid4()),
+                \"word\": \"accomplish\",
+                \"definition\": \"to succeed in doing something\",
+                \"example\": \"She accomplished all her goals this year.\",
+                \"level\": \"B2\",
+                \"word_type\": \"vocabulary\",
+                \"translation_tr\": \"başarmak\",
+                \"created_at\": datetime.now(timezone.utc).isoformat()
+            },
+            {
+                \"id\": str(uuid.uuid4()),
+                \"word\": \"impact\",
+                \"definition\": \"a strong effect or influence\",
+                \"example\": \"Technology has a huge impact on our lives.\",
+                \"level\": \"B2\",
+                \"word_type\": \"vocabulary\",
+                \"translation_tr\": \"etki\",
+                \"created_at\": datetime.now(timezone.utc).isoformat()
+            },
+            {
+                \"id\": str(uuid.uuid4()),
+                \"word\": \"demonstrate\",
+                \"definition\": \"to show clearly\",
+                \"example\": \"The teacher demonstrated how to solve the problem.\",
+                \"level\": \"B2\",
+                \"word_type\": \"vocabulary\",
+                \"translation_tr\": \"göstermek, kanıtlamak\",
+                \"created_at\": datetime.now(timezone.utc).isoformat()
+            },
+            {
+                \"id\": str(uuid.uuid4()),
+                \"word\": \"significant\",
+                \"definition\": \"important or noticeable\",
+                \"example\": \"There was a significant improvement in his performance.\",
+                \"level\": \"B2\",
+                \"word_type\": \"vocabulary\",
+                \"translation_tr\": \"önemli\",
+                \"created_at\": datetime.now(timezone.utc).isoformat()
+            },
+            {
+                \"id\": str(uuid.uuid4()),
+                \"word\": \"adequate\",
+                \"definition\": \"enough or satisfactory\",
+                \"example\": \"We have adequate resources to complete the project.\",
+                \"level\": \"B2\",
+                \"word_type\": \"vocabulary\",
+                \"translation_tr\": \"yeterli\",
+                \"created_at\": datetime.now(timezone.utc).isoformat()
+            },
+            # Collocations
+            {
+                \"id\": str(uuid.uuid4()),
+                \"word\": \"make progress\",
+                \"definition\": \"to improve or advance\",
+                \"example\": \"We're making progress on the new project.\",
+                \"level\": \"B2\",
+                \"word_type\": \"collocation\",
+                \"translation_tr\": \"ilerleme kaydetmek\",
+                \"created_at\": datetime.now(timezone.utc).isoformat()
+            },
+            {
+                \"id\": str(uuid.uuid4()),
+                \"word\": \"take into account\",
+                \"definition\": \"to consider something\",
+                \"example\": \"We need to take into account all possible outcomes.\",
+                \"level\": \"B2\",
+                \"word_type\": \"collocation\",
+                \"translation_tr\": \"dikkate almak\",
+                \"created_at\": datetime.now(timezone.utc).isoformat()
+            },
+            {
+                \"id\": str(uuid.uuid4()),
+                \"word\": \"come up with\",
+                \"definition\": \"to think of an idea or plan\",
+                \"example\": \"She came up with a brilliant solution.\",
+                \"level\": \"B2\",
+                \"word_type\": \"collocation\",
+                \"translation_tr\": \"bulmak, düşünmek\",
+                \"created_at\": datetime.now(timezone.utc).isoformat()
+            },
+            {
+                \"id\": str(uuid.uuid4()),
+                \"word\": \"carry out\",
+                \"definition\": \"to perform or complete a task\",
+                \"example\": \"They carried out a detailed investigation.\",
+                \"level\": \"B2\",
+                \"word_type\": \"collocation\",
+                \"translation_tr\": \"gerçekleştirmek\",
+                \"created_at\": datetime.now(timezone.utc).isoformat()
+            },
+            {
+                \"id\": str(uuid.uuid4()),
+                \"word\": \"break through\",
+                \"definition\": \"to make important progress\",
+                \"example\": \"Scientists finally broke through in their research.\",
+                \"level\": \"B2\",
+                \"word_type\": \"collocation\",
+                \"translation_tr\": \"başarıya ulaşmak\",
+                \"created_at\": datetime.now(timezone.utc).isoformat()
+            },
+            {
+                \"id\": str(uuid.uuid4()),
+                \"word\": \"in detail\",
+                \"definition\": \"with all the facts\",
+                \"example\": \"Please explain the process in detail.\",
+                \"level\": \"B2\",
+                \"word_type\": \"collocation\",
+                \"translation_tr\": \"ayrıntılı olarak\",
+                \"created_at\": datetime.now(timezone.utc).isoformat()
+            },
+            {
+                \"id\": str(uuid.uuid4()),
+                \"word\": \"point of view\",
+                \"definition\": \"a particular way of thinking about something\",
+                \"example\": \"From my point of view, this is the best option.\",
+                \"level\": \"B2\",
+                \"word_type\": \"collocation\",
+                \"translation_tr\": \"bakış açısı\",
+                \"created_at\": datetime.now(timezone.utc).isoformat()
+            },
+        ]
+        
+        await db.words.insert_many(default_words)
+        logger.info(f\"Initialized {len(default_words)} default words\")
+
+
+@app.on_event(\"startup\")
+async def startup_event():
+    await init_default_words()
+    # Initialize daily goal for today
+    today = datetime.now(timezone.utc).strftime(\"%Y-%m-%d\")
+    existing_goal = await db.daily_goals.find_one({\"date\": today, \"user_id\": \"default_user\"})
+    if not existing_goal:
+        goal = DailyGoal(date=today)
+        await db.daily_goals.insert_one(goal.model_dump())
+        logger.info(\"Initialized daily goal for today\")
+
+
+# ============== API ENDPOINTS ==============
+
+@api_router.get(\"/\")
+async def root():
+    return {\"message\": \"English Learning Platform API\"}
+
+
+# Words endpoints
+@api_router.get(\"/words/daily\", response_model=List[Word])
+async def get_daily_words():
+    \"\"\"Get daily words for learning (using spaced repetition)\"\"\"
+    try:
+        # Get words that need review today
+        now = datetime.now(timezone.utc)
+        user_words = await db.user_words.find({
+            \"user_id\": \"default_user\",
+            \"$or\": [
+                {\"next_review\": {\"$lte\": now.isoformat()}},
+                {\"next_review\": None}
+            ]
+        }).to_list(10)
+        
+        # If not enough words for review, get new words
+        if len(user_words) < 10:
+            learned_word_ids = [uw[\"word_id\"] for uw in user_words]
+            all_user_words = await db.user_words.find({\"user_id\": \"default_user\"}).to_list(1000)
+            all_learned_ids = [uw[\"word_id\"] for uw in all_user_words]
+            
+            new_words_needed = 10 - len(user_words)
+            new_words = await db.words.find({
+                \"id\": {\"$nin\": all_learned_ids},
+                \"level\": {\"$in\": [\"B1\", \"B2\"]}
+            }).limit(new_words_needed).to_list(new_words_needed)
+            
+            # Create user_word entries for new words
+            for word in new_words:
+                user_word = UserWord(
+                    word_id=word[\"id\"],
+                    next_review=now
+                )
+                await db.user_words.insert_one(user_word.model_dump())
+            
+            # Get all word details
+            word_ids = [uw[\"word_id\"] for uw in user_words] + [w[\"id\"] for w in new_words]
+        else:
+            word_ids = [uw[\"word_id\"] for uw in user_words[:10]]
+        
+        words = await db.words.find({\"id\": {\"$in\": word_ids}}, {\"_id\": 0}).to_list(10)
+        
+        # Convert datetime strings back to datetime objects
+        for word in words:
+            if isinstance(word.get('created_at'), str):
+                word['created_at'] = datetime.fromisoformat(word['created_at'])
+        
+        return words
+    except Exception as e:
+        logger.error(f\"Error getting daily words: {e}\")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get(\"/words/all\", response_model=List[Word])
+async def get_all_words(word_type: Optional[str] = None):
+    \"\"\"Get all words, optionally filtered by type\"\"\"
+    try:
+        query = {}
+        if word_type:
+            query[\"word_type\"] = word_type
+        
+        words = await db.words.find(query, {\"_id\": 0}).to_list(1000)
+        
+        # Convert datetime strings
+        for word in words:
+            if isinstance(word.get('created_at'), str):
+                word['created_at'] = datetime.fromisoformat(word['created_at'])
+        
+        return words
+    except Exception as e:
+        logger.error(f\"Error getting words: {e}\")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post(\"/words/learn/{word_id}\")
+async def mark_word_learned(word_id: str, update: UserWordUpdate):
+    \"\"\"Mark a word as learned and update confidence\"\"\"
+    try:
+        now = datetime.now(timezone.utc)
+        
+        # Find or create user_word
+        user_word = await db.user_words.find_one({
+            \"user_id\": \"default_user\",
+            \"word_id\": word_id
+        })
+        
+        if user_word:
+            next_review = calculate_next_review(update.confidence)
+            await db.user_words.update_one(
+                {\"id\": user_word[\"id\"]},
+                {
+                    \"$set\": {
+                        \"learned\": update.learned,
+                        \"confidence\": update.confidence,
+                        \"last_reviewed\": now.isoformat(),
+                        \"next_review\": next_review.isoformat()
+                    },
+                    \"$inc\": {\"review_count\": 1}
+                }
+            )
+        else:
+            next_review = calculate_next_review(update.confidence)
+            new_user_word = UserWord(
+                word_id=word_id,
+                learned=update.learned,
+                confidence=update.confidence,
+                last_reviewed=now,
+                next_review=next_review,
+                review_count=1
+            )
+            doc = new_user_word.model_dump()
+            doc['last_reviewed'] = doc['last_reviewed'].isoformat()
+            doc['next_review'] = doc['next_review'].isoformat()
+            await db.user_words.insert_one(doc)
+        
+        # Update daily goal
+        today = datetime.now(timezone.utc).strftime(\"%Y-%m-%d\")
+        await db.daily_goals.update_one(
+            {\"date\": today, \"user_id\": \"default_user\"},
+            {\"$inc\": {\"words_learned\": 1}}
+        )
+        
+        return {\"success\": True, \"message\": \"Word updated successfully\"}
+    except Exception as e:
+        logger.error(f\"Error updating word: {e}\")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Chat endpoints
+@api_router.post(\"/chat\")
+async def chat_with_ai(request: ChatRequest):
+    \"\"\"Chat with AI for English practice\"\"\"
+    try:
+        # Save user message
+        user_msg = ChatMessage(
+            role=\"user\",
+            content=request.message
+        )
+        await db.chat_history.insert_one(user_msg.model_dump())
+        
+        # Get conversation history
+        history = await db.chat_history.find({
+            \"user_id\": \"default_user\"
+        }).sort(\"timestamp\", -1).limit(10).to_list(10)
+        history.reverse()
+        
+        # Initialize LLM Chat
+        chat = LlmChat(
+            api_key=EMERGENT_KEY,
+            session_id=request.conversation_id,
+            system_message=\"\"\"You are an English teacher helping a B1-level student improve to B2-C1. 
+Your role is to:
+1. Have natural conversations in English
+2. Gently correct grammar mistakes
+3. Suggest better word choices and collocations
+4. Keep the conversation engaging and educational
+5. Use vocabulary appropriate for B1-B2 level
+6. Encourage the student to practice speaking naturally
+
+When correcting, be supportive and explain why the correction is better.
+Always respond in English, but you can briefly explain complex words.\"\"\"
+        ).with_model(\"openai\", \"gpt-5.2\")
+        
+        # Send message
+        user_message = UserMessage(text=request.message)
+        response = await chat.send_message(user_message)
+        
+        # Save assistant response
+        assistant_msg = ChatMessage(
+            role=\"assistant\",
+            content=response
+        )
+        await db.chat_history.insert_one(assistant_msg.model_dump())
+        
+        # Update daily goal (approximate 1 minute per message exchange)
+        today = datetime.now(timezone.utc).strftime(\"%Y-%m-%d\")
+        await db.daily_goals.update_one(
+            {\"date\": today, \"user_id\": \"default_user\"},
+            {\"$inc\": {\"chat_minutes\": 1}}
+        )
+        
+        return {\"response\": response}
+    except Exception as e:
+        logger.error(f\"Error in chat: {e}\")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get(\"/chat/history\", response_model=List[ChatMessage])
+async def get_chat_history(limit: int = 50):
+    \"\"\"Get chat history\"\"\"
+    try:
+        history = await db.chat_history.find({
+            \"user_id\": \"default_user\"
+        }).sort(\"timestamp\", -1).limit(limit).to_list(limit)
+        history.reverse()
+        
+        # Convert datetime strings
+        for msg in history:
+            if isinstance(msg.get('timestamp'), str):
+                msg['timestamp'] = datetime.fromisoformat(msg['timestamp'])
+        
+        return history
+    except Exception as e:
+        logger.error(f\"Error getting chat history: {e}\")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# TTS endpoint
+@api_router.post(\"/tts\")
+async def text_to_speech(request: TTSRequest):
+    \"\"\"Convert text to speech\"\"\"
+    try:
+        tts = OpenAITextToSpeech(api_key=EMERGENT_KEY)
+        
+        audio_bytes = await tts.generate_speech(
+            text=request.text,
+            model=\"tts-1\",
+            voice=request.voice
+        )
+        
+        return StreamingResponse(
+            io.BytesIO(audio_bytes),
+            media_type=\"audio/mpeg\",
+            headers={\"Content-Disposition\": \"attachment; filename=speech.mp3\"}
+        )
+    except Exception as e:
+        logger.error(f\"Error in TTS: {e}\")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Progress endpoints
+@api_router.get(\"/progress\")
+async def get_progress():
+    \"\"\"Get user progress\"\"\"
+    try:
+        # Count learned words
+        learned_words = await db.user_words.count_documents({
+            \"user_id\": \"default_user\",
+            \"learned\": True
+        })
+        
+        # Get total words reviewed
+        total_reviewed = await db.user_words.count_documents({
+            \"user_id\": \"default_user\"
+        })
+        
+        # Calculate streak
+        goals = await db.daily_goals.find({
+            \"user_id\": \"default_user\"
+        }).sort(\"date\", -1).to_list(30)
+        
+        streak = 0
+        for goal in goals:
+            if goal.get(\"words_learned\", 0) > 0 or goal.get(\"chat_minutes\", 0) > 0:
+                streak += 1
+            else:
+                break
+        
+        # Total study time (approximate)
+        total_minutes = sum(g.get(\"chat_minutes\", 0) for g in goals)
+        
+        return {
+            \"total_words_learned\": learned_words,
+            \"total_words_reviewed\": total_reviewed,
+            \"streak_days\": streak,
+            \"total_study_minutes\": total_minutes,
+            \"current_level\": \"B2\"  # Can be calculated based on learned_words
+        }
+    except Exception as e:
+        logger.error(f\"Error getting progress: {e}\")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get(\"/goals/today\")
+async def get_today_goal():
+    \"\"\"Get today's goal\"\"\"
+    try:
+        today = datetime.now(timezone.utc).strftime(\"%Y-%m-%d\")
+        goal = await db.daily_goals.find_one({
+            \"date\": today,
+            \"user_id\": \"default_user\"
+        }, {\"_id\": 0})
+        
+        if not goal:
+            # Create today's goal
+            new_goal = DailyGoal(date=today)
+            await db.daily_goals.insert_one(new_goal.model_dump())
+            return new_goal.model_dump()
+        
+        return goal
+    except Exception as e:
+        logger.error(f\"Error getting today's goal: {e}\")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get(\"/stats/weekly\")
+async def get_weekly_stats():
+    \"\"\"Get weekly learning statistics\"\"\"
+    try:
+        # Get last 7 days goals
+        goals = await db.daily_goals.find({
+            \"user_id\": \"default_user\"
+        }).sort(\"date\", -1).limit(7).to_list(7)
+        goals.reverse()
+        
+        return goals
+    except Exception as e:
+        logger.error(f\"Error getting weekly stats: {e}\")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Include the router in the main app
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_methods=[\"*\"],
+    allow_headers=[\"*\"],
+)
+
+
+@app.on_event(\"shutdown\")
+async def shutdown_db_client():
+    client.close()
+"
+Observation: Overwrite successful: /app/backend/server.py

@@ -1,0 +1,29 @@
+
+Action: file_editor view /app/backend/server.py
+Observation: /app/backend/server.py:
+595|        logger.error(f"Error getting today's goal: {e}")
+596|        raise HTTPException(status_code=500, detail=str(e))
+597|
+598|
+599|@api_router.get("/stats/weekly")
+600|async def get_weekly_stats():
+601|    """Get weekly learning statistics"""
+602|    try:
+603|        # Get last 7 days goals
+604|        goals = await db.daily_goals.find({
+605|            "user_id": "default_user"
+606|        }).sort("date", -1).limit(7).to_list(7)
+607|        goals.reverse()
+608|        
+609|        return goals
+610|    except Exception as e:
+611|        logger.error(f"Error getting weekly stats: {e}")
+612|        raise HTTPException(status_code=500, detail=str(e))
+613|
+614|
+615|# Include the router in the main app
+616|app.include_router(api_router)
+617|
+618|app.add_middleware(
+619|    CORSMiddleware,
+620|    allow_credentials=True,

@@ -1,0 +1,111 @@
+Sorun next_review karşılaştırmasında. MongoDB'de string olarak saklandığı için karşılaştırma çalışmıyor. Düzeltelim:
+Action: file_editor str_replace /app/backend/server.py --old-str "@api_router.get(\"/words/daily\", response_model=List[Word])
+async def get_daily_words():
+    \"\"\"Get daily words for learning (using spaced repetition)\"\"\"
+    try:
+        # Get words that need review today
+        now = datetime.now(timezone.utc)
+        user_words = await db.user_words.find({
+            \"user_id\": \"default_user\",
+            \"$or\": [
+                {\"next_review\": {\"$lte\": now.isoformat()}},
+                {\"next_review\": None}
+            ]
+        }).to_list(10)
+        
+        # If not enough words for review, get new words
+        if len(user_words) < 10:
+            learned_word_ids = [uw[\"word_id\"] for uw in user_words]
+            all_user_words = await db.user_words.find({\"user_id\": \"default_user\"}).to_list(1000)
+            all_learned_ids = [uw[\"word_id\"] for uw in all_user_words]
+            
+            new_words_needed = 10 - len(user_words)
+            new_words = await db.words.find({
+                \"id\": {\"$nin\": all_learned_ids},
+                \"level\": {\"$in\": [\"B1\", \"B2\"]}
+            }).limit(new_words_needed).to_list(new_words_needed)
+            
+            # Create user_word entries for new words
+            for word in new_words:
+                user_word = UserWord(
+                    word_id=word[\"id\"],
+                    next_review=now
+                )
+                await db.user_words.insert_one(user_word.model_dump())
+            
+            # Get all word details
+            word_ids = [uw[\"word_id\"] for uw in user_words] + [w[\"id\"] for w in new_words]
+        else:
+            word_ids = [uw[\"word_id\"] for uw in user_words[:10]]
+        
+        words = await db.words.find({\"id\": {\"$in\": word_ids}}, {\"_id\": 0}).to_list(10)
+        
+        # Convert datetime strings back to datetime objects
+        for word in words:
+            if isinstance(word.get('created_at'), str):
+                word['created_at'] = datetime.fromisoformat(word['created_at'])
+        
+        return words
+    except Exception as e:
+        logger.error(f\"Error getting daily words: {e}\")
+        raise HTTPException(status_code=500, detail=str(e))" --new-str "@api_router.get(\"/words/daily\", response_model=List[Word])
+async def get_daily_words():
+    \"\"\"Get daily words for learning (using spaced repetition)\"\"\"
+    try:
+        # Get words that need review today
+        now = datetime.now(timezone.utc)
+        now_str = now.isoformat()
+        
+        # Get all user words and check which need review
+        all_user_words = await db.user_words.find({\"user_id\": \"default_user\"}).to_list(1000)
+        
+        # Filter words that need review (next_review is in the past or None)
+        words_to_review = []
+        for uw in all_user_words:
+            next_review = uw.get(\"next_review\")
+            if next_review is None or (isinstance(next_review, str) and next_review <= now_str):
+                words_to_review.append(uw)
+        
+        # Limit to 10
+        words_to_review = words_to_review[:10]
+        
+        # If not enough words for review, get new words
+        if len(words_to_review) < 10:
+            all_learned_ids = [uw[\"word_id\"] for uw in all_user_words]
+            
+            new_words_needed = 10 - len(words_to_review)
+            new_words = await db.words.find({
+                \"id\": {\"$nin\": all_learned_ids},
+                \"level\": {\"$in\": [\"B1\", \"B2\"]}
+            }).limit(new_words_needed).to_list(new_words_needed)
+            
+            # Create user_word entries for new words
+            for word in new_words:
+                user_word = UserWord(
+                    word_id=word[\"id\"],
+                    next_review=now
+                )
+                doc = user_word.model_dump()
+                if doc.get('next_review'):
+                    doc['next_review'] = doc['next_review'].isoformat()
+                if doc.get('last_reviewed'):
+                    doc['last_reviewed'] = doc['last_reviewed'].isoformat()
+                await db.user_words.insert_one(doc)
+            
+            # Get all word details
+            word_ids = [uw[\"word_id\"] for uw in words_to_review] + [w[\"id\"] for w in new_words]
+        else:
+            word_ids = [uw[\"word_id\"] for uw in words_to_review]
+        
+        words = await db.words.find({\"id\": {\"$in\": word_ids}}, {\"_id\": 0}).to_list(10)
+        
+        # Convert datetime strings back to datetime objects
+        for word in words:
+            if isinstance(word.get('created_at'), str):
+                word['created_at'] = datetime.fromisoformat(word['created_at'])
+        
+        return words
+    except Exception as e:
+        logger.error(f\"Error getting daily words: {e}\")
+        raise HTTPException(status_code=500, detail=str(e))"
+Observation: Edit was successful.

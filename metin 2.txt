@@ -1,0 +1,29 @@
+MongoDB'den dönen _id alanını çıkarmamız gerekiyor. Düzeltelim:
+Action: file_editor str_replace /app/backend/server.py --old-str "@api_router.get(\"/stats/weekly\")
+async def get_weekly_stats():
+    \"\"\"Get weekly learning statistics\"\"\"
+    try:
+        # Get last 7 days goals
+        goals = await db.daily_goals.find({
+            \"user_id\": \"default_user\"
+        }).sort(\"date\", -1).limit(7).to_list(7)
+        goals.reverse()
+        
+        return goals
+    except Exception as e:
+        logger.error(f\"Error getting weekly stats: {e}\")
+        raise HTTPException(status_code=500, detail=str(e))" --new-str "@api_router.get(\"/stats/weekly\")
+async def get_weekly_stats():
+    \"\"\"Get weekly learning statistics\"\"\"
+    try:
+        # Get last 7 days goals
+        goals = await db.daily_goals.find({
+            \"user_id\": \"default_user\"
+        }, {\"_id\": 0}).sort(\"date\", -1).limit(7).to_list(7)
+        goals.reverse()
+        
+        return goals
+    except Exception as e:
+        logger.error(f\"Error getting weekly stats: {e}\")
+        raise HTTPException(status_code=500, detail=str(e))"
+Observation: Edit was successful.

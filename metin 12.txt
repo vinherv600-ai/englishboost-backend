@@ -1,0 +1,54 @@
+
+Action: file_editor view /app/backend/server.py
+Observation: /app/backend/server.py:
+320|        if len(user_words) < 10:
+321|            learned_word_ids = [uw["word_id"] for uw in user_words]
+322|            all_user_words = await db.user_words.find({"user_id": "default_user"}).to_list(1000)
+323|            all_learned_ids = [uw["word_id"] for uw in all_user_words]
+324|            
+325|            new_words_needed = 10 - len(user_words)
+326|            new_words = await db.words.find({
+327|                "id": {"$nin": all_learned_ids},
+328|                "level": {"$in": ["B1", "B2"]}
+329|            }).limit(new_words_needed).to_list(new_words_needed)
+330|            
+331|            # Create user_word entries for new words
+332|            for word in new_words:
+333|                user_word = UserWord(
+334|                    word_id=word["id"],
+335|                    next_review=now
+336|                )
+337|                await db.user_words.insert_one(user_word.model_dump())
+338|            
+339|            # Get all word details
+340|            word_ids = [uw["word_id"] for uw in user_words] + [w["id"] for w in new_words]
+341|        else:
+342|            word_ids = [uw["word_id"] for uw in user_words[:10]]
+343|        
+344|        words = await db.words.find({"id": {"$in": word_ids}}, {"_id": 0}).to_list(10)
+345|        
+346|        # Convert datetime strings back to datetime objects
+347|        for word in words:
+348|            if isinstance(word.get('created_at'), str):
+349|                word['created_at'] = datetime.fromisoformat(word['created_at'])
+350|        
+351|        return words
+352|    except Exception as e:
+353|        logger.error(f"Error getting daily words: {e}")
+354|        raise HTTPException(status_code=500, detail=str(e))
+355|
+356|
+357|@api_router.get("/words/all", response_model=List[Word])
+358|async def get_all_words(word_type: Optional[str] = None):
+359|    """Get all words, optionally filtered by type"""
+360|    try:
+361|        query = {}
+362|        if word_type:
+363|            query["word_type"] = word_type
+364|        
+365|        words = await db.words.find(query, {"_id": 0}).to_list(1000)
+366|        
+367|        # Convert datetime strings
+368|        for word in words:
+369|            if isinstance(word.get('created_at'), str):
+370|                word['created_at'] = datetime.fromisoformat(word['created_at'])
