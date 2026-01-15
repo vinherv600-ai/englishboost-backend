@@ -1,29 +1,79 @@
+# EnglishBoost Backend — MongoDB safe + Render ready
+from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, Field
+from typing import Optional, List
+from datetime import datetime, timedelta, timezone
+import uuid, os, io
 
-Action: file_editor view /app/backend/server.py
-Observation: /app/backend/server.py:
-595|        logger.error(f"Error getting today's goal: {e}")
-596|        raise HTTPException(status_code=500, detail=str(e))
-597|
-598|
-599|@api_router.get("/stats/weekly")
-600|async def get_weekly_stats():
-601|    """Get weekly learning statistics"""
-602|    try:
-603|        # Get last 7 days goals
-604|        goals = await db.daily_goals.find({
-605|            "user_id": "default_user"
-606|        }).sort("date", -1).limit(7).to_list(7)
-607|        goals.reverse()
-608|        
-609|        return goals
-610|    except Exception as e:
-611|        logger.error(f"Error getting weekly stats: {e}")
-612|        raise HTTPException(status_code=500, detail=str(e))
-613|
-614|
-615|# Include the router in the main app
-616|app.include_router(api_router)
-617|
-618|app.add_middleware(
-619|    CORSMiddleware,
-620|    allow_credentials=True,
+# ===== ENV =====
+MONGO_URL = os.environ.get("MONGO_URL")
+DB_NAME = os.environ.get("DB_NAME")
+EMERGENT_KEY = os.environ.get("EMERGENT_LLM_KEY")
+
+client = AsyncIOMotorClient(MONGO_URL)
+db = client[DB_NAME]
+
+app = FastAPI()
+api = APIRouter(prefix="/api")
+
+# ===== MODELS =====
+
+class Word(BaseModel):
+    id: str
+    word: str
+    definition: str
+    example: str
+    level: str
+    word_type: str
+    translation_tr: Optional[str]
+
+class ChatRequest(BaseModel):
+    message: str
+
+# ===== HELPERS =====
+
+def clean(doc):
+    if not doc: return doc
+    doc.pop("_id", None)
+    return doc
+
+# ===== ROUTES =====
+
+@api.get("/")
+async def root():
+    return {"status":"EnglishBoost backend online"}
+
+@api.get("/words/daily")
+async def daily_words():
+    words = await db.words.find({},{"_id":0}).limit(10).to_list(10)
+    return words
+
+@api.post("/chat")
+async def chat(req: ChatRequest):
+    # temporary echo AI (Emergent yerine)
+    response = f"You said: {req.message}. Let's practice more!"
+    await db.chat.insert_one({
+        "text": req.message,
+        "time": datetime.now(timezone.utc).isoformat()
+    })
+    return {"response": response}
+
+@api.get("/progress")
+async def progress():
+    total = await db.chat.count_documents({})
+    return {
+        "total_messages": total,
+        "level": "B1 → B2"
+    }
+
+app.include_router(api)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
